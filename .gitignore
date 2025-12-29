@@ -2,6 +2,9 @@
 .env
 .env.local
 
+# Secrets
+.secrets/
+
 # Temp files
 .cloud-init.yml
 

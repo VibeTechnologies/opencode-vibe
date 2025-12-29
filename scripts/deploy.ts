@@ -6,6 +6,7 @@
  *   bun run scripts/deploy.ts
  *   bun run scripts/deploy.ts --status
  *   bun run scripts/deploy.ts --destroy
+ *   bun run scripts/deploy.ts --update
  *   bun run scripts/deploy.ts --update-env
  *   bun run scripts/deploy.ts --update-auth
  *   bun run scripts/deploy.ts --sync-auth
@@ -30,7 +31,7 @@
  *   - GITHUB_TOKEN from environment/.env
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { execSync, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
@@ -41,6 +42,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT_DIR = join(__dirname, "..");
 const ENV_FILE = join(ROOT_DIR, ".env");
+const SECRETS_DIR = join(ROOT_DIR, ".secrets");
 const OPENCODE_AUTH_FILE = join(homedir(), ".local/share/opencode/auth.json");
 
 let config = {
@@ -151,6 +153,47 @@ function checkAzureLogin(): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+function saveSecrets(url: string, username: string, password: string) {
+  if (!existsSync(SECRETS_DIR)) {
+    mkdirSync(SECRETS_DIR, { recursive: true });
+  }
+  
+  const date = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+  const secretsFile = join(SECRETS_DIR, `${date}.json`);
+  
+  const secrets = {
+    url,
+    username,
+    password,
+    createdAt: new Date().toISOString(),
+  };
+  
+  writeFileSync(secretsFile, JSON.stringify(secrets, null, 2));
+  console.log(`Secrets saved to ${secretsFile}`);
+}
+
+function getLatestSecrets(): { url: string; username: string; password: string } | null {
+  if (!existsSync(SECRETS_DIR)) {
+    return null;
+  }
+  
+  const files = require("fs").readdirSync(SECRETS_DIR)
+    .filter((f: string) => f.endsWith(".json"))
+    .sort()
+    .reverse();
+  
+  if (files.length === 0) {
+    return null;
+  }
+  
+  const latestFile = join(SECRETS_DIR, files[0]);
+  try {
+    return JSON.parse(readFileSync(latestFile, "utf-8"));
+  } catch {
+    return null;
   }
 }
 
@@ -389,7 +432,13 @@ async function showStatus() {
     if (urlMatch) {
       console.log(`\nTunnel URL: ${urlMatch[0]}`);
       console.log(`Username: ${config.authUsername}`);
-      console.log(`(Password was set during deployment)`);
+      
+      const secrets = getLatestSecrets();
+      if (secrets && secrets.password) {
+        console.log(`Password: ${secrets.password}`);
+      } else {
+        console.log(`(Password was set during deployment - check .secrets/ folder)`);
+      }
     }
 
     console.log("\nOpenCode Manager logs (last 5 lines):");
@@ -516,6 +565,22 @@ async function uploadOpencodeAuth(ip: string) {
   return true;
 }
 
+async function updateOpencode(ip: string) {
+  console.log("Updating opencode-manager to latest version...");
+  const sshOpts = "-o StrictHostKeyChecking=no";
+  const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
+
+  // Pull latest code
+  console.log("Pulling latest code from GitHub...");
+  exec(`${sshCmd} "cd ~/opencode-manager && git fetch origin && git reset --hard origin/main"`, { quiet: false });
+
+  // Rebuild and restart containers
+  console.log("Rebuilding and restarting containers...");
+  exec(`${sshCmd} "cd ~/opencode-manager && sudo docker compose up -d --build"`, { quiet: false });
+
+  console.log("\nUpdate complete! opencode-manager is now running the latest version.");
+}
+
 async function syncAuth(ip: string) {
   console.log("Syncing authentication to remote VM...\n");
   const sshOpts = "-o StrictHostKeyChecking=no";
@@ -610,6 +675,11 @@ async function main() {
   // Check if VM exists for update commands (these don't need password)
   const existingIP = getVMIP();
   
+  if (existingIP && args.includes("--update")) {
+    await updateOpencode(existingIP);
+    return;
+  }
+
   if (existingIP && args.includes("--sync-auth")) {
     await syncAuth(existingIP);
     return;
@@ -673,6 +743,7 @@ async function main() {
   const urlMatch = tunnelLogs.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
   if (urlMatch) {
     console.log(`\nTunnel URL: ${urlMatch[0]}`);
+    saveSecrets(urlMatch[0], config.authUsername, config.authPassword);
   }
   
   console.log(`\nCredentials:`);
