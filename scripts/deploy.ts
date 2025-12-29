@@ -6,12 +6,28 @@
  *   bun run scripts/deploy.ts
  *   bun run scripts/deploy.ts --status
  *   bun run scripts/deploy.ts --destroy
+ *   bun run scripts/deploy.ts --update-env
+ *   bun run scripts/deploy.ts --update-auth
+ *   bun run scripts/deploy.ts --sync-auth
  * 
  * Environment variables:
  *   AUTH_USERNAME - Basic auth username (default: admin)
  *   AUTH_PASSWORD - Basic auth password (prompted if not set)
  *   AZURE_LOCATION - Azure region (default: westus2)
  *   AZURE_VM_SIZE - VM size (default: Standard_D2s_v5)
+ *   GITHUB_TOKEN - GitHub token for opencode-manager (cloning private repos)
+ * 
+ * OpenCode configuration:
+ *   ANTHROPIC_API_KEY - Anthropic API key for Claude models
+ *   OPENAI_API_KEY - OpenAI API key
+ *   GEMINI_API_KEY - Google Gemini API key
+ *   OPENROUTER_API_KEY - OpenRouter API key
+ *   OPENCODE_CONFIG_FILE - Path to local opencode.json config to upload
+ * 
+ * Auth sync (--sync-auth):
+ *   Syncs both OpenCode auth and GitHub token to the remote VM:
+ *   - ~/.local/share/opencode/auth.json (GitHub Copilot, Anthropic OAuth, etc.)
+ *   - GITHUB_TOKEN from environment/.env
  */
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
@@ -19,11 +35,13 @@ import { join, dirname } from "path";
 import { execSync, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import * as readline from "readline";
+import { homedir } from "os";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT_DIR = join(__dirname, "..");
 const ENV_FILE = join(ROOT_DIR, ".env");
+const OPENCODE_AUTH_FILE = join(homedir(), ".local/share/opencode/auth.json");
 
 let config = {
   resourceGroup: "opencode-manager-rg",
@@ -33,6 +51,14 @@ let config = {
   adminUser: "azureuser",
   authUsername: "admin",
   authPassword: "",
+  githubToken: "",
+  // OpenCode provider keys
+  anthropicApiKey: "",
+  openaiApiKey: "",
+  geminiApiKey: "",
+  openrouterApiKey: "",
+  // OpenCode config file path
+  opencodeConfigFile: "",
 };
 
 function exec(cmd: string, options?: { quiet?: boolean }): string {
@@ -85,6 +111,14 @@ function initConfig() {
     adminUser: "azureuser",
     authUsername: process.env.AUTH_USERNAME || "admin",
     authPassword: process.env.AUTH_PASSWORD || "",
+    githubToken: process.env.GITHUB_TOKEN || "",
+    // OpenCode provider keys
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
+    openaiApiKey: process.env.OPENAI_API_KEY || "",
+    geminiApiKey: process.env.GEMINI_API_KEY || "",
+    openrouterApiKey: process.env.OPENROUTER_API_KEY || "",
+    // OpenCode config file path
+    opencodeConfigFile: process.env.OPENCODE_CONFIG_FILE || "",
   };
 }
 
@@ -210,7 +244,7 @@ async function waitForDocker(ip: string) {
   throw new Error("Docker failed to start");
 }
 
-function deployToVM(ip: string) {
+async function deployToVM(ip: string) {
   console.log("Deploying opencode-manager to VM...");
   const sshOpts = "-o StrictHostKeyChecking=no";
   const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
@@ -262,6 +296,8 @@ function deployToVM(ip: string) {
       - caddy
 
   app:
+    env_file:
+      - .env
     ports: []
 
 volumes:
@@ -271,6 +307,39 @@ volumes:
 
   const composeBase64 = Buffer.from(composeOverride).toString("base64");
   exec(`${sshCmd} "echo '${composeBase64}' | base64 -d > ~/opencode-manager/docker-compose.override.yml"`, { quiet: true });
+
+  // Create .env file with GitHub token and OpenCode provider keys if provided
+  const envLines: string[] = [];
+  if (config.githubToken) {
+    envLines.push(`GITHUB_TOKEN=${config.githubToken}`);
+  }
+  if (config.anthropicApiKey) {
+    envLines.push(`ANTHROPIC_API_KEY=${config.anthropicApiKey}`);
+  }
+  if (config.openaiApiKey) {
+    envLines.push(`OPENAI_API_KEY=${config.openaiApiKey}`);
+  }
+  if (config.geminiApiKey) {
+    envLines.push(`GEMINI_API_KEY=${config.geminiApiKey}`);
+  }
+  if (config.openrouterApiKey) {
+    envLines.push(`OPENROUTER_API_KEY=${config.openrouterApiKey}`);
+  }
+
+  if (envLines.length > 0) {
+    console.log("Configuring environment variables...");
+    const envContent = envLines.join("\n");
+    const envBase64 = Buffer.from(envContent).toString("base64");
+    exec(`${sshCmd} "echo '${envBase64}' | base64 -d > ~/opencode-manager/.env"`, { quiet: true });
+  }
+
+  // Upload OpenCode config file if specified
+  if (config.opencodeConfigFile) {
+    await uploadOpencodeConfig(ip);
+  }
+
+  // Sync OpenCode auth from local machine
+  await uploadOpencodeAuth(ip);
 
   // Build and start
   console.log("Starting Docker containers (this may take a few minutes)...");
@@ -355,6 +424,167 @@ async function redeployAuth(ip: string) {
   console.log("Authentication updated!");
 }
 
+async function updateEnv(ip: string) {
+  console.log("Updating environment configuration...");
+  const sshOpts = "-o StrictHostKeyChecking=no";
+  const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
+
+  // Build env content
+  const envLines: string[] = [];
+  if (config.githubToken) {
+    envLines.push(`GITHUB_TOKEN=${config.githubToken}`);
+  }
+  if (config.anthropicApiKey) {
+    envLines.push(`ANTHROPIC_API_KEY=${config.anthropicApiKey}`);
+  }
+  if (config.openaiApiKey) {
+    envLines.push(`OPENAI_API_KEY=${config.openaiApiKey}`);
+  }
+  if (config.geminiApiKey) {
+    envLines.push(`GEMINI_API_KEY=${config.geminiApiKey}`);
+  }
+  if (config.openrouterApiKey) {
+    envLines.push(`OPENROUTER_API_KEY=${config.openrouterApiKey}`);
+  }
+
+  if (envLines.length === 0 && !config.opencodeConfigFile) {
+    console.log("No environment variables or config to update.");
+    console.log("Set GITHUB_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, etc. in your environment or .env file.");
+    return;
+  }
+
+  if (envLines.length > 0) {
+    const envContent = envLines.join("\n");
+    const envBase64 = Buffer.from(envContent).toString("base64");
+    exec(`${sshCmd} "echo '${envBase64}' | base64 -d > ~/opencode-manager/.env"`, { quiet: true });
+    console.log("Environment file updated with: " + envLines.map(l => l.split("=")[0]).join(", "));
+  }
+
+  // Upload OpenCode config file if specified
+  if (config.opencodeConfigFile) {
+    await uploadOpencodeConfig(ip);
+  }
+
+  // Restart the app container to pick up new env
+  console.log("Restarting app container...");
+  exec(`${sshCmd} "cd ~/opencode-manager && sudo docker compose up -d app"`, { quiet: true });
+  console.log("Environment updated and app restarted!");
+}
+
+async function uploadOpencodeConfig(ip: string) {
+  const sshOpts = "-o StrictHostKeyChecking=no";
+  const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
+
+  if (!config.opencodeConfigFile) return;
+
+  const configPath = join(ROOT_DIR, config.opencodeConfigFile);
+  if (!existsSync(configPath)) {
+    console.log(`Warning: OpenCode config file not found: ${configPath}`);
+    return;
+  }
+
+  console.log("Uploading OpenCode config...");
+  const configContent = readFileSync(configPath, "utf-8");
+  const configBase64 = Buffer.from(configContent).toString("base64");
+  
+  // Create the opencode config directory and upload config
+  // The config goes to /workspace/.config/opencode/ which is the global config location inside the container
+  exec(`${sshCmd} "mkdir -p ~/opencode-manager/workspace/.config/opencode"`, { quiet: true });
+  exec(`${sshCmd} "echo '${configBase64}' | base64 -d > ~/opencode-manager/workspace/.config/opencode/opencode.json"`, { quiet: true });
+  console.log("OpenCode config uploaded to workspace/.config/opencode/opencode.json");
+}
+
+async function uploadOpencodeAuth(ip: string) {
+  const sshOpts = "-o StrictHostKeyChecking=no";
+  const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
+
+  if (!existsSync(OPENCODE_AUTH_FILE)) {
+    console.log("No local OpenCode auth.json found at ~/.local/share/opencode/auth.json");
+    console.log("Run 'opencode' and use /connect to authenticate with providers first.");
+    return false;
+  }
+
+  console.log("Uploading OpenCode authentication...");
+  const authContent = readFileSync(OPENCODE_AUTH_FILE, "utf-8");
+  const authBase64 = Buffer.from(authContent).toString("base64");
+  
+  // Copy auth.json directly into the running container's workspace volume
+  exec(`${sshCmd} "sudo docker exec opencode-manager mkdir -p /workspace/.local/share/opencode"`, { quiet: true });
+  exec(`${sshCmd} "echo '${authBase64}' | base64 -d | sudo docker exec -i opencode-manager tee /workspace/.local/share/opencode/auth.json > /dev/null"`, { quiet: true });
+  exec(`${sshCmd} "sudo docker exec opencode-manager chmod 600 /workspace/.local/share/opencode/auth.json"`, { quiet: true });
+  console.log("OpenCode auth uploaded (GitHub Copilot, Anthropic OAuth, etc.)");
+  return true;
+}
+
+async function syncAuth(ip: string) {
+  console.log("Syncing authentication to remote VM...\n");
+  const sshOpts = "-o StrictHostKeyChecking=no";
+  const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
+
+  let hasChanges = false;
+
+  // 1. Sync OpenCode auth.json directly into the container
+  const authUploaded = await uploadOpencodeAuth(ip);
+  if (authUploaded) hasChanges = true;
+
+  // 2. Sync GitHub token to opencode-manager settings API and .env
+  if (config.githubToken) {
+    console.log("Syncing GitHub token...");
+    
+    // Update .env file for container environment
+    let existingEnv = "";
+    try {
+      existingEnv = execOutput(`${sshCmd} "cat ~/opencode-manager/.env 2>/dev/null || echo ''"`);
+    } catch {}
+
+    const envLines = existingEnv.split("\n").filter(line => line.trim() && !line.startsWith("GITHUB_TOKEN="));
+    envLines.push(`GITHUB_TOKEN=${config.githubToken}`);
+    
+    const envContent = envLines.join("\n");
+    const envBase64 = Buffer.from(envContent).toString("base64");
+    exec(`${sshCmd} "echo '${envBase64}' | base64 -d > ~/opencode-manager/.env"`, { quiet: true });
+    
+    // Also set gitToken in opencode-manager settings via API
+    // Wait for container to be healthy first
+    console.log("Waiting for API to be ready...");
+    await sleep(3000);
+    
+    try {
+      const settingsPayload = JSON.stringify({ preferences: { gitToken: config.githubToken } });
+      exec(`${sshCmd} "curl -s -X PATCH http://localhost:5003/api/settings -H 'Content-Type: application/json' -d '${settingsPayload}'"`, { quiet: true });
+      console.log("GitHub token synced to opencode-manager settings");
+    } catch (e) {
+      console.log("Warning: Could not update settings API (container may still be starting)");
+    }
+    
+    hasChanges = true;
+  } else {
+    console.log("No GITHUB_TOKEN set in environment or .env file (skipping)");
+  }
+
+  if (hasChanges) {
+    console.log("\nRestarting app container to pick up changes...");
+    exec(`${sshCmd} "cd ~/opencode-manager && sudo docker compose restart app"`, { quiet: true });
+    
+    // Set gitToken via API after restart
+    if (config.githubToken) {
+      console.log("Waiting for container to restart...");
+      await sleep(5000);
+      try {
+        const settingsPayload = JSON.stringify({ preferences: { gitToken: config.githubToken } });
+        exec(`${sshCmd} "curl -s -X PATCH http://localhost:5003/api/settings -H 'Content-Type: application/json' -d '${settingsPayload}'"`, { quiet: true });
+        console.log("GitHub token configured in opencode-manager");
+      } catch (e) {
+        console.log("Warning: Could not update settings API after restart");
+      }
+    }
+    
+    console.log("Auth synced and app restarted!");
+  } else {
+    console.log("\nNo authentication to sync.");
+  }
+}
+
 async function main() {
   loadEnv();
   initConfig();
@@ -377,7 +607,33 @@ async function main() {
     process.exit(1);
   }
 
-  // Get or prompt for password
+  // Check if VM exists for update commands (these don't need password)
+  const existingIP = getVMIP();
+  
+  if (existingIP && args.includes("--sync-auth")) {
+    await syncAuth(existingIP);
+    return;
+  }
+
+  if (existingIP && args.includes("--update-env")) {
+    await updateEnv(existingIP);
+    return;
+  }
+
+  if (existingIP && args.includes("--update-auth")) {
+    // This one needs password for updating Basic Auth
+    if (!config.authPassword) {
+      config.authPassword = await promptPassword();
+      if (!config.authPassword) {
+        console.error("Password is required for --update-auth");
+        process.exit(1);
+      }
+    }
+    await redeployAuth(existingIP);
+    return;
+  }
+
+  // Get or prompt for password (only for fresh deployment)
   if (!config.authPassword) {
     const useGenerated = !process.stdin.isTTY;
     if (useGenerated) {
@@ -392,13 +648,6 @@ async function main() {
     }
   }
 
-  // Check if VM exists for update
-  const existingIP = getVMIP();
-  if (existingIP && args.includes("--update-auth")) {
-    await redeployAuth(existingIP);
-    return;
-  }
-
   console.log("\n=== OpenCode Manager Deployment ===\n");
   console.log(`Username: ${config.authUsername}`);
   console.log(`Password: ${config.authPassword}`);
@@ -408,7 +657,7 @@ async function main() {
   const ip = createVM();
   await waitForVM(ip);
   await waitForDocker(ip);
-  deployToVM(ip);
+  await deployToVM(ip);
 
   // Wait for tunnel
   console.log("\nWaiting for tunnel...");
