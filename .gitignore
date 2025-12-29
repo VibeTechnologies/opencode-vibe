@@ -1,0 +1,12 @@
+# Environment
+.env
+.env.local
+
+# Temp files
+.cloud-init.yml
+
+# OS
+.DS_Store
+
+# Node
+node_modules/

@@ -1,0 +1,15 @@
+{
+  "name": "opencode-vibe",
+  "version": "1.0.0",
+  "description": "Deploy opencode-manager to Azure with Basic Auth and Cloudflare Tunnel",
+  "scripts": {
+    "deploy": "bun run scripts/deploy.ts",
+    "status": "bun run scripts/deploy.ts --status",
+    "destroy": "bun run scripts/deploy.ts --destroy"
+  },
+  "devDependencies": {
+    "bun-types": "latest"
+  },
+  "keywords": ["opencode", "azure", "remote", "deployment"],
+  "license": "MIT"
+}
