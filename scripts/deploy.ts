@@ -10,6 +10,7 @@
  *   bun run scripts/deploy.ts --update-env
  *   bun run scripts/deploy.ts --update-auth
  *   bun run scripts/deploy.ts --sync-auth
+ *   bun run scripts/deploy.ts --yolo
  * 
  * Environment variables:
  *   AUTH_USERNAME - Basic auth username (default: admin)
@@ -315,7 +316,16 @@ async function deployToVM(ip: string) {
   const caddyBase64 = Buffer.from(caddyfile).toString("base64");
   exec(`${sshCmd} "echo '${caddyBase64}' | base64 -d > ~/opencode-manager/Caddyfile"`, { quiet: true });
 
-  // Create docker-compose.override.yml with Caddy
+  // Upload custom Dockerfile for extended image with Chrome, etc.
+  console.log("Uploading custom Dockerfile...");
+  const dockerfilePath = join(__dirname, "Dockerfile.custom");
+  if (existsSync(dockerfilePath)) {
+    const dockerfileContent = readFileSync(dockerfilePath, "utf-8");
+    const dockerfileBase64 = Buffer.from(dockerfileContent).toString("base64");
+    exec(`${sshCmd} "echo '${dockerfileBase64}' | base64 -d > ~/opencode-manager/Dockerfile.custom"`, { quiet: true });
+  }
+
+  // Create docker-compose.override.yml with Caddy and custom build
   const composeOverride = `services:
   caddy:
     image: caddy:2-alpine
@@ -339,6 +349,9 @@ async function deployToVM(ip: string) {
       - caddy
 
   app:
+    build:
+      context: .
+      dockerfile: Dockerfile.custom
     env_file:
       - .env
     ports: []
@@ -387,6 +400,11 @@ volumes:
   // Build and start
   console.log("Starting Docker containers (this may take a few minutes)...");
   exec(`${sshCmd} "cd ~/opencode-manager && sudo docker compose up -d --build"`, { quiet: false });
+
+  // Wait for container to be ready and enable YOLO mode
+  console.log("Waiting for container to start...");
+  await sleep(5000);
+  await enableYoloMode(ip);
 
   console.log("Deployment complete!");
 }
@@ -565,6 +583,134 @@ async function uploadOpencodeAuth(ip: string) {
   return true;
 }
 
+async function enableYoloMode(ip: string) {
+  console.log("Enabling YOLO mode (auto-approve all permissions)...");
+  const sshOpts = "-o StrictHostKeyChecking=no";
+  const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
+
+  const yoloConfig = `{
+  "$schema": "https://opencode.ai/config.json",
+  "autoapprove": true
+}`;
+
+  // Wait for opencode-manager to fully start and sync its config
+  console.log("Waiting for opencode-manager to initialize...");
+  const maxAttempts = 12;
+  for (let i = 0; i < maxAttempts; i++) {
+    const health = execOutput(`${sshCmd} "curl -s http://localhost:5003/api/health 2>/dev/null || echo 'not ready'"`);
+    if (health.includes('"status":"ok"') || health.includes('ok')) {
+      break;
+    }
+    process.stdout.write(".");
+    await sleep(2000);
+  }
+  console.log(" ready!");
+
+  // Wait a bit more for config sync to complete
+  await sleep(3000);
+
+  // Write config directly into the running container (AFTER opencode-manager syncs its config)
+  // Use heredoc approach to avoid escaping issues
+  const writeCmd = `${sshCmd} 'cat << "YOLOEOF" | sudo docker exec -i opencode-manager tee /workspace/.config/opencode/opencode.json > /dev/null
+${yoloConfig}
+YOLOEOF'`;
+  exec(writeCmd, { quiet: true });
+
+  // Verify the config was written correctly
+  const verifyCmd = `${sshCmd} "sudo docker exec opencode-manager cat /workspace/.config/opencode/opencode.json"`;
+  const writtenConfig = execOutput(verifyCmd);
+  
+  if (writtenConfig.includes('"autoapprove": true') || writtenConfig.includes('"autoapprove":true')) {
+    console.log("YOLO mode enabled - all permissions will be auto-approved");
+  } else {
+    console.log("Warning: YOLO mode config may not have been written correctly");
+    console.log("Written config:", writtenConfig);
+    // Try one more time with base64
+    const configBase64 = Buffer.from(yoloConfig).toString("base64");
+    exec(`${sshCmd} "echo '${configBase64}' | base64 -d | sudo docker exec -i opencode-manager tee /workspace/.config/opencode/opencode.json > /dev/null"`, { quiet: true });
+    console.log("Retried with base64 encoding");
+  }
+}
+
+function patchDockerfile(ip: string) {
+  const sshOpts = "-o StrictHostKeyChecking=no";
+  const sshCmd = `ssh ${sshOpts} ${config.adminUser}@${ip}`;
+  
+  // Read the Dockerfile
+  const dockerfile = execOutput(`${sshCmd} "cat ~/opencode-manager/Dockerfile"`);
+  
+  // Check if already patched
+  if (dockerfile.includes('google-chrome-unstable')) {
+    console.log("Dockerfile already includes Chrome, skipping patch");
+    return;
+  }
+  
+  // Add Chromium and browser dependencies to the apt-get install command
+  let patchedDockerfile = dockerfile.replace(
+    /python3-venv \\\n\s+&& rm -rf/,
+    `python3-venv \\
+    # Browser dependencies
+    chromium \\
+    fonts-liberation \\
+    libasound2 \\
+    libatk-bridge2.0-0 \\
+    libatk1.0-0 \\
+    libatspi2.0-0 \\
+    libcairo2 \\
+    libcups2 \\
+    libdbus-1-3 \\
+    libdrm2 \\
+    libgbm1 \\
+    libglib2.0-0 \\
+    libgtk-3-0 \\
+    libgtk-4-1 \\
+    libnspr4 \\
+    libnss3 \\
+    libpango-1.0-0 \\
+    libx11-6 \\
+    libxcb1 \\
+    libxcomposite1 \\
+    libxdamage1 \\
+    libxext6 \\
+    libxfixes3 \\
+    libxkbcommon0 \\
+    libxrandr2 \\
+    xdg-utils \\
+    wget \\
+    gnupg \\
+    && rm -rf`
+  );
+  
+  // Add Google Chrome Dev installation after the first apt-get block
+  // Insert after "rm -rf /var/lib/apt/lists/*" in the base stage
+  const chromeInstallBlock = `
+
+# Install Google Chrome Dev (unstable) for latest features
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \\
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \\
+    && apt-get update \\
+    && apt-get install -y google-chrome-unstable \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Chrome environment variables
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-unstable
+ENV CHROME_PATH=/usr/bin/google-chrome-unstable
+ENV CHROMIUM_PATH=/usr/bin/chromium
+`;
+
+  // Insert after the first RUN block (after rm -rf /var/lib/apt/lists/*)
+  patchedDockerfile = patchedDockerfile.replace(
+    /(RUN apt-get update && apt-get install -y[\s\S]*?&& rm -rf \/var\/lib\/apt\/lists\/\*)/,
+    `$1${chromeInstallBlock}`
+  );
+  
+  // Write the patched Dockerfile back
+  const dockerfileBase64 = Buffer.from(patchedDockerfile).toString("base64");
+  exec(`${sshCmd} "echo '${dockerfileBase64}' | base64 -d > ~/opencode-manager/Dockerfile"`, { quiet: true });
+  console.log("Dockerfile patched with Chromium + Google Chrome Dev");
+}
+
 async function updateOpencode(ip: string) {
   console.log("Updating opencode-manager to latest version...");
   const sshOpts = "-o StrictHostKeyChecking=no";
@@ -574,11 +720,63 @@ async function updateOpencode(ip: string) {
   console.log("Pulling latest code from GitHub...");
   exec(`${sshCmd} "cd ~/opencode-manager && git fetch origin && git reset --hard origin/main"`, { quiet: false });
 
+  // Patch Dockerfile to add Chrome and browser dependencies
+  console.log("Patching Dockerfile to add Chrome...");
+  patchDockerfile(ip);
+
+  // Update docker-compose.override.yml (without custom Dockerfile since we patched the original)
+  console.log("Updating docker-compose.override.yml...");
+  const composeOverride = `services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy-auth
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-tunnel
+    command: tunnel --no-autoupdate --url http://caddy:80
+    restart: unless-stopped
+    depends_on:
+      - caddy
+
+  app:
+    env_file:
+      - .env
+    ports: []
+    environment:
+      - PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-unstable
+      - CHROME_PATH=/usr/bin/google-chrome-unstable
+      - CHROMIUM_PATH=/usr/bin/chromium
+
+volumes:
+  caddy_data:
+  caddy_config:
+`;
+  const composeBase64 = Buffer.from(composeOverride).toString("base64");
+  exec(`${sshCmd} "echo '${composeBase64}' | base64 -d > ~/opencode-manager/docker-compose.override.yml"`, { quiet: true });
+
   // Rebuild and restart containers
-  console.log("Rebuilding and restarting containers...");
+  console.log("Rebuilding and restarting containers (this may take a few minutes for first build)...");
   exec(`${sshCmd} "cd ~/opencode-manager && sudo docker compose up -d --build"`, { quiet: false });
 
-  console.log("\nUpdate complete! opencode-manager is now running the latest version.");
+  // Wait for container to be ready
+  console.log("Waiting for container to start...");
+  await sleep(5000);
+
+  // Enable YOLO mode
+  await enableYoloMode(ip);
+
+  console.log("\nUpdate complete! opencode-manager is now running the latest version with YOLO mode.");
 }
 
 async function syncAuth(ip: string) {
@@ -677,6 +875,11 @@ async function main() {
   
   if (existingIP && args.includes("--update")) {
     await updateOpencode(existingIP);
+    return;
+  }
+
+  if (existingIP && args.includes("--yolo")) {
+    await enableYoloMode(existingIP);
     return;
   }
 
