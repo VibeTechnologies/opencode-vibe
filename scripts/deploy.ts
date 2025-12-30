@@ -678,6 +678,9 @@ function patchDockerfile(ip: string) {
     xdg-utils \\
     wget \\
     gnupg \\
+    # Xvfb for running Chrome with extensions (non-headless)
+    xvfb \\
+    x11-utils \\
     && rm -rf`
   );
   
@@ -697,6 +700,7 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-unstable
 ENV CHROME_PATH=/usr/bin/google-chrome-unstable
 ENV CHROMIUM_PATH=/usr/bin/chromium
+ENV DISPLAY=:99
 `;
 
   // Insert after the first RUN block (after rm -rf /var/lib/apt/lists/*)
@@ -757,6 +761,7 @@ async function updateOpencode(ip: string) {
       - PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-unstable
       - CHROME_PATH=/usr/bin/google-chrome-unstable
       - CHROMIUM_PATH=/usr/bin/chromium
+      - DISPLAY=:99
 
 volumes:
   caddy_data:
